@@ -42,12 +42,21 @@ _BACKEND_DIR = Path(__file__).parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from pydantic import ValidationError
 
 from agent_graph import run_pipeline
 from cache import cache as analysis_cache
+from errors import (
+    BudgetExceededError,
+    ExtractionError,
+    NicheNotFoundError,
+    PainMinerError,
+    RedditFetchError,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -63,21 +72,81 @@ logging.basicConfig(
 app = FastAPI(
     title="Reddit Pain Point Miner API",
     description="Mine Reddit for product pain points using a LangGraph agent.",
-    version="0.4.0",
+    version="0.7.0",
 )
 
-# CORS — allow the Vite dev server (and localhost variants) to call the API
+# CORS — allow Vite dev server, localhost variants, and Vercel production
+_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+]
+# Accept any Vercel deployment URL (*.vercel.app) via allow_origin_regex
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite default
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",   # Create-React-App fallback
-    ],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Consistent error handlers
+# ---------------------------------------------------------------------------
+# All handlers return the same shape: {"error": true, "message": str, "code": str}
+# This lets the frontend switch on `code` without parsing message strings.
+
+@app.exception_handler(PainMinerError)
+async def pain_miner_error_handler(request: Request, exc: PainMinerError) -> JSONResponse:
+    logger.warning("[%s] %s — %s", exc.code, request.url.path, exc.message)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+
+@app.exception_handler(RedditFetchError)
+async def reddit_fetch_handler(request: Request, exc: RedditFetchError) -> JSONResponse:
+    logger.error("[reddit_fetch_error] %s", exc.message)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+
+@app.exception_handler(ExtractionError)
+async def extraction_handler(request: Request, exc: ExtractionError) -> JSONResponse:
+    logger.error("[extraction_error] %s", exc.message)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+
+@app.exception_handler(BudgetExceededError)
+async def budget_handler(request: Request, exc: BudgetExceededError) -> JSONResponse:
+    logger.warning("[budget_exceeded] %s", exc.message)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+
+@app.exception_handler(NicheNotFoundError)
+async def niche_not_found_handler(request: Request, exc: NicheNotFoundError) -> JSONResponse:
+    logger.info("[niche_not_found] %s", exc.message)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": True, "message": exc.detail, "code": "http_error"},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception at %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": True,
+            "message": "An internal server error occurred. Please try again.",
+            "code": "internal_error",
+        },
+    )
 
 # ---------------------------------------------------------------------------
 # In-memory job registry
